@@ -58,6 +58,13 @@ PDF открывается постранично. Кнопки `← PDF` и `PD
 5. OpenCV digit detector - локальный детектор печатных цифр на схемах.
 6. OpenCV multiscale detector - повторный поиск маленьких цифр на увеличенных копиях изображения.
 7. Tesseract - если Tesseract установлен отдельно и добавлен в `PATH`.
+8. YOLO pretrained detector - optional backend through `ultralytics`. The built-in pretrained model is COCO-based and is mainly a bridge for future custom weights. For real parts diagrams place a trained model at `models/yolo_numbers.pt` or set `PARTS_YOLO_MODEL=C:\path\to\model.pt`.
+
+YOLO settings:
+
+- `PARTS_YOLO_MODEL` - custom `.pt` model path. If omitted, the app first checks `models/yolo_numbers.pt`, then falls back to Ultralytics pretrained models.
+- `PARTS_YOLO_IMGSZ` - inference size, default is selected automatically between 1280 and 2200.
+- `PARTS_YOLO_CONF` - YOLO confidence threshold, default is `0.18` for number-aware models and `0.25` for generic pretrained models.
 
 Для PDF без нормального текстового слоя приложение отдельно отрисовывает текущую страницу в увеличенном масштабе для OCR. Это не меняет сам PDF и нужно только для поиска мелких номеров на качественных схемах.
 

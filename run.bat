@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo Starting Parts Hotspot app v3...
+echo Starting Parts Hotspot app v4.18 YOLO...
 echo Folder: %cd%
 echo.
 
@@ -26,7 +26,7 @@ if not exist ".venv\.deps-installed" (
     type nul > ".venv\.deps-installed"
 )
 
-".venv\Scripts\python.exe" -c "import PIL, winsdk, pytesseract, fitz, cv2" >nul 2>nul
+".venv\Scripts\python.exe" -c "import PIL, winsdk, pytesseract, fitz, cv2, ultralytics" >nul 2>nul
 if errorlevel 1 (
     echo Dependencies are incomplete. Reinstalling...
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt

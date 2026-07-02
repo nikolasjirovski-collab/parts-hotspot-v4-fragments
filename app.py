@@ -40,7 +40,11 @@ HQ_RENDER_MAX_SCALE = 12.0
 WORK_TILE_SIZE = 96
 FINAL_TILE_SIZE = 64
 FINAL_SUPERSAMPLE = 3
-APP_BUILD = "2026-06-19 09:18 v4.17 fragments"
+APP_BUILD = "2026-07-02 10:45 v4.18 YOLO fragments"
+YOLO_MODEL_ENV = "PARTS_YOLO_MODEL"
+YOLO_IMGSZ_ENV = "PARTS_YOLO_IMGSZ"
+YOLO_CONF_ENV = "PARTS_YOLO_CONF"
+YOLO_DEFAULT_MODELS = ("yolo26n.pt", "yolo11n.pt", "yolov8n.pt")
 GRID_OCR_PASSES = (
     (256, 128),
     (320, 160),
@@ -491,6 +495,332 @@ class TesseractBackend:
                         source=self.name,
                     )
                 )
+        return _dedupe_spots(spots)
+
+
+class YoloPretrainedBackend:
+    name = "YOLO pretrained detector"
+    _model_cache: dict[str, object] = {}
+    _label_hints = ("number", "digit", "label", "text", "callout", "circled", "position", "pos")
+
+    def available(self) -> bool:
+        return _ultralytics_available()
+
+    def recognize_digits(self, image_path: Path, known_numbers: set[str] | None = None) -> list[Hotspot]:
+        if not self.available():
+            raise OcrError("ultralytics is not installed")
+
+        known_numbers = known_numbers or set()
+        with Image.open(image_path) as image:
+            source = image.convert("RGB")
+        image_width, image_height = source.size
+
+        model, _model_ref, model_kind = self._load_model()
+        names = self._model_names(model)
+        number_aware = self._model_has_number_classes(names)
+        image_size = self._predict_image_size(image_width, image_height)
+        confidence = self._predict_confidence(number_aware)
+
+        try:
+            results = model.predict(
+                source=str(image_path),
+                imgsz=image_size,
+                conf=confidence,
+                iou=0.45,
+                verbose=False,
+            )
+        except TypeError:
+            results = model(str(image_path))
+
+        direct_spots: list[Hotspot] = []
+        digit_candidates: list[dict[str, float | str]] = []
+        ocr_boxes: list[dict[str, float | str]] = []
+        source_name = f"YOLO {model_kind}"
+
+        for result in results:
+            result_names = getattr(result, "names", None) or names
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                parsed = self._parse_result_box(box, result_names, image_width, image_height)
+                if parsed is None:
+                    continue
+
+                label = str(parsed["label"])
+                number = self._direct_number_from_label(label)
+                if number is not None:
+                    if len(number) == 1:
+                        digit_candidates.append(
+                            {
+                                "digit": number,
+                                "score": float(parsed["confidence"]),
+                                "x": float(parsed["left"]),
+                                "y": float(parsed["top"]),
+                                "w": float(parsed["width"]),
+                                "h": float(parsed["height"]),
+                                "cx": float(parsed["x"]),
+                                "cy": float(parsed["y"]),
+                            }
+                        )
+                    else:
+                        resolved = resolve_ocr_number(number, known_numbers)
+                        if resolved is None:
+                            continue
+                        direct_spots.append(
+                            Hotspot(
+                                number=resolved,
+                                x=float(parsed["x"]),
+                                y=float(parsed["y"]),
+                                width=float(parsed["width"]),
+                                height=float(parsed["height"]),
+                                source=f"{source_name} {float(parsed['confidence']):.2f} class:{label}",
+                            )
+                        )
+                    continue
+
+                if number_aware and self._label_is_ocr_candidate(label):
+                    ocr_boxes.append(parsed)
+
+        grouped_digit_spots = self._group_yolo_digits(digit_candidates, known_numbers, source_name)
+        ocr_spots = self._recognize_yolo_boxes(source, ocr_boxes, known_numbers, source_name)
+        return _dedupe_spots([*direct_spots, *grouped_digit_spots, *ocr_spots])
+
+    def _load_model(self):
+        from ultralytics import YOLO
+
+        last_error: Exception | None = None
+        for model_ref, model_kind in self._model_candidates():
+            cache_key = str(model_ref)
+            if cache_key in self._model_cache:
+                return self._model_cache[cache_key], cache_key, model_kind
+            try:
+                model = YOLO(cache_key)
+            except Exception as exc:
+                last_error = exc
+                if model_kind != "pretrained":
+                    break
+                continue
+            self._model_cache[cache_key] = model
+            return model, cache_key, model_kind
+        raise OcrError(f"YOLO model could not be loaded: {last_error}")
+
+    def _model_candidates(self) -> list[tuple[str, str]]:
+        env_model = os.environ.get(YOLO_MODEL_ENV, "").strip()
+        if env_model:
+            return [(env_model, "custom")]
+
+        app_dir = application_dir()
+        local_candidates = (
+            app_dir / "models" / "yolo_numbers.pt",
+            app_dir / "models" / "parts_numbers.pt",
+            app_dir / "yolo_numbers.pt",
+        )
+        for path in local_candidates:
+            if path.exists():
+                return [(str(path), "custom")]
+
+        return [(model_name, "pretrained") for model_name in YOLO_DEFAULT_MODELS]
+
+    def _model_names(self, model) -> dict[int, str]:
+        names = getattr(model, "names", {}) or {}
+        if isinstance(names, dict):
+            return {int(key): str(value) for key, value in names.items()}
+        return {index: str(value) for index, value in enumerate(names)}
+
+    def _model_has_number_classes(self, names: dict[int, str]) -> bool:
+        return any(
+            self._direct_number_from_label(label) is not None or self._label_is_ocr_candidate(label)
+            for label in names.values()
+        )
+
+    def _direct_number_from_label(self, label: str) -> str | None:
+        normalized = label.strip().lower().replace("_", " ").replace("-", " ")
+        if normalized.isdigit():
+            return normalize_number(normalized)
+        match = re.fullmatch(r"(?:number|num|digit|pos|position|class)\s*(\d{1,4})", normalized)
+        if match:
+            return normalize_number(match.group(1))
+        return None
+
+    def _label_is_ocr_candidate(self, label: str) -> bool:
+        normalized = label.strip().lower().replace("_", " ").replace("-", " ")
+        return any(hint in normalized for hint in self._label_hints)
+
+    def _predict_image_size(self, width: int, height: int) -> int:
+        configured = os.environ.get(YOLO_IMGSZ_ENV, "").strip()
+        if configured.isdigit():
+            return max(640, min(3200, int(configured)))
+        largest = max(width, height)
+        if largest >= 2200:
+            return 2200
+        if largest >= 1400:
+            return 1800
+        return 1280
+
+    def _predict_confidence(self, number_aware: bool) -> float:
+        configured = os.environ.get(YOLO_CONF_ENV, "").strip().replace(",", ".")
+        try:
+            value = float(configured) if configured else (0.18 if number_aware else 0.25)
+        except ValueError:
+            value = 0.18 if number_aware else 0.25
+        return max(0.03, min(0.95, value))
+
+    def _parse_result_box(
+        self,
+        box,
+        names: dict[int, str],
+        image_width: int,
+        image_height: int,
+    ) -> dict[str, float | str] | None:
+        try:
+            xyxy_raw = box.xyxy[0]
+            try:
+                left, top, right, bottom = [float(value) for value in xyxy_raw.detach().cpu().tolist()]
+            except AttributeError:
+                left, top, right, bottom = [float(value) for value in xyxy_raw]
+
+            confidence = self._scalar(getattr(box, "conf", [0.0])[0])
+            class_id = int(self._scalar(getattr(box, "cls", [0])[0]))
+        except Exception:
+            return None
+
+        left = max(0.0, min(float(image_width - 1), left))
+        top = max(0.0, min(float(image_height - 1), top))
+        right = max(left + 1.0, min(float(image_width), right))
+        bottom = max(top + 1.0, min(float(image_height), bottom))
+        width = right - left
+        height = bottom - top
+        if not self._candidate_box_size_ok(width, height, image_width, image_height):
+            return None
+
+        return {
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "x": (left + right) / 2,
+            "y": (top + bottom) / 2,
+            "width": width,
+            "height": height,
+            "confidence": confidence,
+            "label": names.get(class_id, str(class_id)),
+        }
+
+    def _scalar(self, value) -> float:
+        try:
+            return float(value.detach().cpu().item())
+        except AttributeError:
+            return float(value)
+
+    def _candidate_box_size_ok(self, width: float, height: float, image_width: int, image_height: int) -> bool:
+        if width < 2 or height < 2:
+            return False
+        if width > image_width * 0.35 or height > image_height * 0.25:
+            return False
+        if width * height > image_width * image_height * 0.08:
+            return False
+        return True
+
+    def _group_yolo_digits(
+        self,
+        digit_candidates: list[dict[str, float | str]],
+        known_numbers: set[str],
+        source_name: str,
+    ) -> list[Hotspot]:
+        if not digit_candidates:
+            return []
+
+        spots: list[Hotspot] = []
+        for group in OpenCVDigitBackend()._group_digits(digit_candidates):
+            number = normalize_number("".join(str(item["digit"]) for item in group))
+            resolved = resolve_ocr_number(number, known_numbers)
+            if resolved is None:
+                continue
+
+            left = min(float(item["x"]) for item in group)
+            top = min(float(item["y"]) for item in group)
+            right = max(float(item["x"]) + float(item["w"]) for item in group)
+            bottom = max(float(item["y"]) + float(item["h"]) for item in group)
+            confidence = sum(float(item["score"]) for item in group) / len(group)
+            spots.append(
+                Hotspot(
+                    number=resolved,
+                    x=(left + right) / 2,
+                    y=(top + bottom) / 2,
+                    width=max(right - left, 1),
+                    height=max(bottom - top, 1),
+                    source=f"{source_name} {confidence:.2f} digit-classes",
+                )
+            )
+        return spots
+
+    def _recognize_yolo_boxes(
+        self,
+        source: Image.Image,
+        boxes: list[dict[str, float | str]],
+        known_numbers: set[str],
+        source_name: str,
+    ) -> list[Hotspot]:
+        if not boxes:
+            return []
+
+        ocr_backends = []
+        if WindowsOcrBackend().available():
+            ocr_backends.append(WindowsOcrBackend())
+        if OpenCVDigitBackend().available():
+            ocr_backends.append(OpenCVDigitBackend())
+        if TesseractBackend().available():
+            ocr_backends.append(TesseractBackend())
+        if not ocr_backends:
+            return []
+
+        spots: list[Hotspot] = []
+        boxes = sorted(boxes, key=lambda item: float(item["confidence"]), reverse=True)[:80]
+        image_width, image_height = source.size
+        for index, box in enumerate(boxes):
+            box_width = float(box["width"])
+            box_height = float(box["height"])
+            pad = max(6, int(round(max(box_width, box_height) * 0.70)))
+            left = max(0, int(math.floor(float(box["left"]) - pad)))
+            top = max(0, int(math.floor(float(box["top"]) - pad)))
+            right = min(image_width, int(math.ceil(float(box["right"]) + pad)))
+            bottom = min(image_height, int(math.ceil(float(box["bottom"]) + pad)))
+            if right - left < 4 or bottom - top < 4:
+                continue
+
+            crop = source.crop((left, top, right, bottom)).convert("RGB")
+            scale = min(8.0, max(1.0, 180.0 / max(crop.width, crop.height, 1)))
+            if scale > 1.01:
+                crop = crop.resize(
+                    (max(1, int(round(crop.width * scale))), max(1, int(round(crop.height * scale)))),
+                    Image.Resampling.LANCZOS,
+                )
+            crop_path = Path(tempfile.gettempdir()) / f"parts_yolo_crop_{os.getpid()}_{index}.png"
+            crop.save(crop_path)
+            try:
+                for backend in ocr_backends:
+                    try:
+                        raw_spots = backend.recognize_digits(crop_path, known_numbers)
+                    except Exception:
+                        continue
+                    for spot in raw_spots:
+                        resolved = resolve_ocr_number(spot.number, known_numbers)
+                        if resolved is None:
+                            continue
+                        spots.append(
+                            Hotspot(
+                                number=resolved,
+                                x=left + spot.x / scale,
+                                y=top + spot.y / scale,
+                                width=max(spot.width / scale, 1),
+                                height=max(spot.height / scale, 1),
+                                source=f"{source_name} {float(box['confidence']):.2f} crop; {spot.source}",
+                            )
+                        )
+            finally:
+                crop_path.unlink(missing_ok=True)
+
         return _dedupe_spots(spots)
 
 
@@ -1023,6 +1353,14 @@ def _opencv_available() -> bool:
     try:
         import cv2  # noqa: F401
         import numpy  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _ultralytics_available() -> bool:
+    try:
+        import ultralytics  # noqa: F401
     except Exception:
         return False
     return True
@@ -1769,6 +2107,7 @@ class PartsHotspotApp(tk.Tk):
         self.add_mode = tk.BooleanVar(value=False)
         self.crop_mode = tk.BooleanVar(value=False)
         self.lasso_mode = tk.BooleanVar(value=False)
+        self.yolo_enabled_var = tk.BooleanVar(value=True)
         self.crop_all_pdf_pages = tk.BooleanVar(value=True)
         self.rotation_angle_var = tk.StringVar(value="0")
         self.quality_auto_trim_var = tk.BooleanVar(value=True)
@@ -1823,9 +2162,18 @@ class PartsHotspotApp(tk.Tk):
             row=0, column=0, sticky="ew"
         )
 
-        ttk.Label(sidebar, textvariable=self.ocr_status, foreground="#555").grid(
-            row=1, column=0, sticky="w", pady=(4, 7)
+        ocr_status_row = ttk.Frame(sidebar)
+        ocr_status_row.grid(row=1, column=0, sticky="ew", pady=(4, 7))
+        ocr_status_row.columnconfigure(0, weight=1)
+        ttk.Label(ocr_status_row, textvariable=self.ocr_status, foreground="#555").grid(
+            row=0, column=0, sticky="ew"
         )
+        ttk.Checkbutton(
+            ocr_status_row,
+            text="YOLO",
+            variable=self.yolo_enabled_var,
+            command=self.update_ocr_backend_status,
+        ).grid(row=0, column=1, sticky="e", padx=(5, 0))
 
         pdf_buttons = ttk.Frame(sidebar)
         pdf_buttons.grid(row=2, column=0, sticky="ew", pady=(0, 5))
@@ -2206,6 +2554,9 @@ class PartsHotspotApp(tk.Tk):
             return "OCR доступен: " + ", ".join(available)
         return "OCR пока недоступен: установите зависимости через run.bat"
 
+    def update_ocr_backend_status(self) -> None:
+        self.ocr_status.set(self._backend_status_text())
+
     def _ocr_backends(
         self,
     ) -> list[
@@ -2218,8 +2569,10 @@ class PartsHotspotApp(tk.Tk):
         | CircledNumberBackend
         | OpenCVDigitBackend
         | MultiScaleOpenCVDigitBackend
+        | YoloPretrainedBackend
         | TesseractBackend
     ]:
+        yolo_backends = [YoloPretrainedBackend()] if self.yolo_enabled_var.get() else []
         if self.current_image_is_pdf_page:
             return [
                 GridTileOcrBackend(),
@@ -2228,6 +2581,7 @@ class PartsHotspotApp(tk.Tk):
                 LeaderEndpointOcrBackend(),
                 LineLabelDigitBackend(),
                 DenseCropWindowsOcrBackend(),
+                *yolo_backends,
                 OpenCVDigitBackend(),
                 TesseractBackend(),
             ]
@@ -2236,6 +2590,7 @@ class PartsHotspotApp(tk.Tk):
             WindowsOcrBackend(),
             LeaderEndpointOcrBackend(),
             CircledNumberBackend(),
+            *yolo_backends,
             OpenCVDigitBackend(),
             MultiScaleOpenCVDigitBackend(),
             TesseractBackend(),
@@ -3084,6 +3439,8 @@ class PartsHotspotApp(tk.Tk):
             return "opencv"
         if "circled number detector" in source:
             return "circled"
+        if "yolo " in source:
+            return "yolo"
         if "windows ocr" in source:
             return "windows"
         if "tesseract" in source:
@@ -3136,6 +3493,10 @@ class PartsHotspotApp(tk.Tk):
             return -1.0
         if "circled number detector" in source:
             return -1.0
+        if "yolo custom" in source:
+            return -1.4 if confidence is not None and confidence >= 0.55 else 0.8
+        if "yolo pretrained" in source:
+            return 2.5 if confidence is not None and confidence >= 0.50 else 4.0
         if "opencv digit detector" in source:
             return 2.0 if confidence is not None and confidence >= 0.74 else 5.0
         if "800 grid ocr" in source:
@@ -3144,7 +3505,7 @@ class PartsHotspotApp(tk.Tk):
 
     def is_weak_pdf_source(self, spot: Hotspot) -> bool:
         source = spot.source.lower()
-        return "opencv digit detector" in source or "800 grid ocr" in source
+        return "opencv digit detector" in source or "800 grid ocr" in source or "yolo pretrained" in source
 
     def source_has_note(self, spot: Hotspot, note: str) -> bool:
         return any(part.strip().lower() == note.lower() for part in spot.source.split(";"))
@@ -3483,7 +3844,7 @@ class PartsHotspotApp(tk.Tk):
 
         position_score = self.candidate_position_score(number, candidate, references, spacing, height)
         source = candidate.source.lower()
-        weak_source = "opencv digit detector" in source or "800 grid ocr" in source
+        weak_source = self.is_weak_pdf_source(candidate)
         if (line_score <= 0.85 or sequence_score <= 0.90) and not weak_source:
             self.remove_source_note(candidate, "review")
             return
