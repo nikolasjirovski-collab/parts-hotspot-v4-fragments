@@ -1,0 +1,5 @@
+Pillow>=10.4.0
+winsdk>=1.0.0b10; sys_platform == "win32"
+pytesseract>=0.3.13
+PyMuPDF>=1.24.0
+opencv-python-headless>=4.10.0
