@@ -40,7 +40,7 @@ HQ_RENDER_MAX_SCALE = 12.0
 WORK_TILE_SIZE = 96
 FINAL_TILE_SIZE = 64
 FINAL_SUPERSAMPLE = 3
-APP_BUILD = "2026-07-02 10:45 v4.18 YOLO fragments"
+APP_BUILD = "2026-07-09 11:12 v4.18 YOLO HQ-fragment-fix"
 YOLO_MODEL_ENV = "PARTS_YOLO_MODEL"
 YOLO_IMGSZ_ENV = "PARTS_YOLO_IMGSZ"
 YOLO_CONF_ENV = "PARTS_YOLO_CONF"
@@ -330,6 +330,11 @@ class WindowsOcrBackend:
         if not self.available():
             raise OcrError("winsdk не установлен")
         return asyncio.run(self._recognize_digits_with_tiles_async(image_path))
+
+    def recognize_digits_single(self, image_path: Path) -> list[Hotspot]:
+        if not self.available():
+            raise OcrError("winsdk is not installed")
+        return asyncio.run(self._recognize_digits_async(image_path))
 
     async def _recognize_digits_with_tiles_async(self, image_path: Path) -> list[Hotspot]:
         spots = await self._recognize_digits_async(image_path)
@@ -652,7 +657,7 @@ class YoloPretrainedBackend:
         if configured.isdigit():
             return max(640, min(3200, int(configured)))
         largest = max(width, height)
-        if largest >= 2200:
+        if largest >= 4000:
             return 2200
         if largest >= 1400:
             return 1800
@@ -765,20 +770,21 @@ class YoloPretrainedBackend:
         if not boxes:
             return []
 
-        ocr_backends = []
-        if WindowsOcrBackend().available():
-            ocr_backends.append(WindowsOcrBackend())
+        windows_backend = WindowsOcrBackend() if WindowsOcrBackend().available() else None
+        other_backends = []
         if OpenCVDigitBackend().available():
-            ocr_backends.append(OpenCVDigitBackend())
+            other_backends.append(OpenCVDigitBackend())
         if TesseractBackend().available():
-            ocr_backends.append(TesseractBackend())
-        if not ocr_backends:
+            other_backends.append(TesseractBackend())
+        if windows_backend is None and not other_backends:
             return []
 
         spots: list[Hotspot] = []
-        boxes = sorted(boxes, key=lambda item: float(item["confidence"]), reverse=True)[:80]
+        box_limit = max(120, min(260, len(known_numbers) + 80 if known_numbers else 160))
+        boxes = sorted(boxes, key=lambda item: float(item["confidence"]), reverse=True)[:box_limit]
         image_width, image_height = source.size
-        for index, box in enumerate(boxes):
+        prepared: list[tuple[Image.Image, tuple[int, int, int, int], float, float]] = []
+        for box in boxes:
             box_width = float(box["width"])
             box_height = float(box["height"])
             pad = max(6, int(round(max(box_width, box_height) * 0.70)))
@@ -796,30 +802,86 @@ class YoloPretrainedBackend:
                     (max(1, int(round(crop.width * scale))), max(1, int(round(crop.height * scale)))),
                     Image.Resampling.LANCZOS,
                 )
-            crop_path = Path(tempfile.gettempdir()) / f"parts_yolo_crop_{os.getpid()}_{index}.png"
-            crop.save(crop_path)
+            prepared.append((crop, (left, top, right, bottom), scale, float(box["confidence"])))
+
+        batch_size = 48
+        for batch_index in range(0, len(prepared), batch_size):
+            batch = prepared[batch_index : batch_index + batch_size]
+            padding = 20
+            max_width = 2200
+            x = padding
+            y = padding
+            row_height = 0
+            montage_items: list[tuple[Image.Image, int, int]] = []
+            placement_items: list[tuple[LabelMontagePlacement, float]] = []
+
+            for crop, source_box, scale, confidence in batch:
+                if x + crop.width + padding > max_width:
+                    x = padding
+                    y += row_height + padding
+                    row_height = 0
+                montage_items.append((crop, x, y))
+                placement_items.append(
+                    (
+                        LabelMontagePlacement(
+                            montage_x=x,
+                            montage_y=y,
+                            scale=scale,
+                            source_box=source_box,
+                            width=crop.width,
+                            height=crop.height,
+                        ),
+                        confidence,
+                    )
+                )
+                x += crop.width + padding
+                row_height = max(row_height, crop.height)
+
+            if not montage_items:
+                continue
+
+            montage = Image.new("RGB", (max_width, y + row_height + padding), "white")
+            for crop, crop_x, crop_y in montage_items:
+                montage.paste(crop, (crop_x, crop_y))
+            montage_path = (
+                Path(tempfile.gettempdir())
+                / f"parts_yolo_montage_{os.getpid()}_{batch_index // batch_size}.png"
+            )
+            montage.save(montage_path)
+            raw_spots: list[Hotspot] = []
             try:
-                for backend in ocr_backends:
+                if windows_backend is not None:
                     try:
-                        raw_spots = backend.recognize_digits(crop_path, known_numbers)
+                        raw_spots.extend(windows_backend.recognize_digits_single(montage_path))
                     except Exception:
-                        continue
-                    for spot in raw_spots:
-                        resolved = resolve_ocr_number(spot.number, known_numbers)
-                        if resolved is None:
-                            continue
-                        spots.append(
-                            Hotspot(
-                                number=resolved,
-                                x=left + spot.x / scale,
-                                y=top + spot.y / scale,
-                                width=max(spot.width / scale, 1),
-                                height=max(spot.height / scale, 1),
-                                source=f"{source_name} {float(box['confidence']):.2f} crop; {spot.source}",
-                            )
-                        )
+                        pass
+                for backend in other_backends:
+                    try:
+                        raw_spots.extend(backend.recognize_digits(montage_path, known_numbers))
+                    except Exception:
+                        pass
             finally:
-                crop_path.unlink(missing_ok=True)
+                montage_path.unlink(missing_ok=True)
+
+            for spot in raw_spots:
+                resolved = resolve_ocr_number(spot.number, known_numbers)
+                if resolved is None:
+                    continue
+                for placement, confidence in placement_items:
+                    if not placement.contains(spot.x, spot.y):
+                        continue
+                    mapped_x, mapped_y = placement.to_image_point(spot.x, spot.y)
+                    spots.append(
+                        Hotspot(
+                            number=resolved,
+                            x=mapped_x,
+                            y=mapped_y,
+                            width=max(spot.width / placement.scale, 1),
+                            height=max(spot.height / placement.scale, 1),
+                            source=f"{source_name} {confidence:.2f} crop; {spot.source}",
+                        )
+                    )
+                    break
 
         return _dedupe_spots(spots)
 
@@ -1438,7 +1500,7 @@ def _find_leader_line_endpoints(image_path: Path, max_points: int = 120) -> list
 
     candidates: list[tuple[float, float, float]] = []
     if raw_lines is not None:
-        for raw_line in raw_lines[:, 0]:
+        for raw_line in np.asarray(raw_lines).reshape(-1, 4):
             x1, y1, x2, y2 = [float(value) for value in raw_line]
             length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
             if length < 18 or length > max(gray.shape[:2]) * 0.55:
@@ -2573,7 +2635,12 @@ class PartsHotspotApp(tk.Tk):
         | TesseractBackend
     ]:
         yolo_backends = [YoloPretrainedBackend()] if self.yolo_enabled_var.get() else []
-        if self.current_image_is_pdf_page:
+        is_pdf_fragment = (
+            self.source_type == "pdf"
+            and self.raster_source_image is not None
+            and not self.current_image_is_pdf_page
+        )
+        if self.current_image_is_pdf_page or is_pdf_fragment:
             return [
                 GridTileOcrBackend(),
                 WindowsOcrBackend(),
@@ -2874,6 +2941,44 @@ class PartsHotspotApp(tk.Tk):
     def prepare_ocr_image(self) -> tuple[Path, float, float, float, str]:
         if self.image_path is None:
             raise OcrError("Не открыт файл для OCR")
+
+        if (
+            self.original_image is not None
+            and not self.current_image_is_pdf_page
+            and self.raster_source_image is not None
+            and self.source_to_work_scale > 0
+        ):
+            image = self.raster_source_image.convert("RGB")
+            resize_scale = 1.0
+            max_side = 3200
+            largest = max(image.size)
+            if largest > max_side:
+                resize_scale = max_side / largest
+                image = image.resize(
+                    (
+                        max(1, int(round(image.width * resize_scale))),
+                        max(1, int(round(image.height * resize_scale))),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+
+            coord_scale = self.source_to_work_scale / resize_scale
+            coord_offset_x = self.source_to_work_offset_x
+            coord_offset_y = self.source_to_work_offset_y
+            image = self.apply_brush_strokes_to_ocr_image(
+                image,
+                coord_scale,
+                coord_offset_x,
+                coord_offset_y,
+            )
+            path = self.write_temp_image(image, "raster_hq_ocr")
+            return (
+                path,
+                coord_scale,
+                coord_offset_x,
+                coord_offset_y,
+                f"HQ source {image.width}x{image.height}",
+            )
 
         if (
             self.pdf_document is None
@@ -3574,7 +3679,7 @@ class PartsHotspotApp(tk.Tk):
 
         segments: list[LeaderLineSegment] = []
         if raw_lines is not None:
-            for raw_line in raw_lines[:, 0]:
+            for raw_line in np.asarray(raw_lines).reshape(-1, 4):
                 x1, y1, x2, y2 = [float(value) for value in raw_line]
                 length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
                 if length < 14 or length > 360:
@@ -4606,13 +4711,27 @@ class PartsHotspotApp(tk.Tk):
         source_suffix = "" if ocr_source == "изображение" else f" ({ocr_source})"
         self.status.set(f"Распознаю цифры{source_suffix}: {backend_names}. Подождите...")
 
+        self.set_fragment_progress(1.0, f"OCR: 0/{len(available_backends)}")
+
         def worker() -> None:
             errors: list[str] = []
             backend_report: list[str] = list(initial_report)
             results: list[tuple[str, list[Hotspot]]] = list(initial_results)
-            for backend in available_backends:
+            for backend_index, backend in enumerate(available_backends):
                 if run_id != self.ocr_run_id:
                     return
+                progress_value = 5.0 + backend_index / max(len(available_backends), 1) * 88.0
+                progress_text = f"OCR {backend_index + 1}/{len(available_backends)}: {backend.name}"
+                self.after(
+                    0,
+                    lambda value=progress_value,
+                    text=progress_text,
+                    current_run_id=run_id: (
+                        self.set_fragment_progress(value, text)
+                        if current_run_id == self.ocr_run_id
+                        else None
+                    ),
+                )
                 use_work_image = isinstance(backend, GridTileOcrBackend)
                 backend_image_path = self.image_path if use_work_image and self.image_path is not None else ocr_image_path
                 backend_scale = 1.0 if use_work_image else coord_scale
@@ -4732,7 +4851,21 @@ class PartsHotspotApp(tk.Tk):
                 ),
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        def guarded_worker() -> None:
+            try:
+                worker()
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda captured_error=exc, current_run_id=run_id: self._finish_ocr(
+                        [],
+                        captured_error,
+                        "OCR internal error",
+                        current_run_id,
+                    ),
+                )
+
+        threading.Thread(target=guarded_worker, daemon=True).start()
 
     def finalize_ocr_spots_for_current(self, spots: list[Hotspot], known_numbers: set[str]) -> list[Hotspot]:
         spots = self.infer_missing_sequence_spots(spots, known_numbers)

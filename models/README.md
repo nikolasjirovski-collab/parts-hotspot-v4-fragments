@@ -12,4 +12,4 @@ The app will use this file automatically. You can also point to another model wi
 set PARTS_YOLO_MODEL=C:\path\to\model.pt
 ```
 
-Do not commit large `.pt` model files unless you intentionally want to store model weights in the repository.
+This version includes `yolo_numbers.pt` intentionally so the saved branch is reproducible.
