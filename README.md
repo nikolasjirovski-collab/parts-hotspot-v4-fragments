@@ -23,6 +23,8 @@
 
 Для обычной работы рекомендуется portable-выпуск: в нём уже есть Python, PyTorch, OCR и модели YOLO.
 
+[Скачать portable v4.20](https://github.com/nikolasjirovski-collab/parts-hotspot-v4-fragments/releases/tag/v4.20-portable)
+
 ## Правильный порядок работы
 
 1. Нажмите `Добавить файлы` и выберите один или несколько PDF либо изображений.
