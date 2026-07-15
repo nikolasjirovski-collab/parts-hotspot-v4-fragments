@@ -47,7 +47,7 @@ HQ_RENDER_MAX_SCALE = 12.0
 WORK_TILE_SIZE = 96
 FINAL_TILE_SIZE = 64
 FINAL_SUPERSAMPLE = 3
-APP_BUILD = "2026-07-10 11:35 v4.20 tiled YOLO + number OCR"
+APP_BUILD = "2026-07-15 16:50 v4.21 YOLO main + number OCR"
 YOLO_MODEL_ENV = "PARTS_YOLO_MODEL"
 YOLO_IMGSZ_ENV = "PARTS_YOLO_IMGSZ"
 YOLO_CONF_ENV = "PARTS_YOLO_CONF"
@@ -3342,7 +3342,7 @@ class PartsHotspotApp(tk.Tk):
         )
         ttk.Checkbutton(
             ocr_status_row,
-            text="YOLO",
+            text="YOLO основной",
             variable=self.yolo_enabled_var,
             command=self.update_ocr_backend_status,
         ).grid(row=0, column=1, sticky="e", padx=(5, 0))
@@ -3786,7 +3786,6 @@ class PartsHotspotApp(tk.Tk):
                 LineLabelWindowsBackend(),
                 LeaderEndpointOcrBackend(),
                 LineLabelDigitBackend(),
-                *full_yolo,
             ]
             fallback = [
                 ParallelDenseCropWindowsOcrBackend(),
@@ -3800,7 +3799,6 @@ class PartsHotspotApp(tk.Tk):
                 LeaderEndpointOcrBackend(),
                 LineLabelDigitBackend(),
                 WindowsOcrBackend(),
-                *full_yolo,
             ]
             fallback = [
                 CircledNumberBackend(),
@@ -3810,11 +3808,14 @@ class PartsHotspotApp(tk.Tk):
                 TesseractBackend(),
             ]
 
-        for backend in tiled_yolo:
+        primary_yolo = [*tiled_yolo, *full_yolo]
+        for backend in primary_yolo:
+            backend.refinement_level = 0
+        for backend in fast:
             backend.refinement_level = 1
         for backend in fallback:
             backend.refinement_level = 2
-        return [*fast, *tiled_yolo, *fallback]
+        return [*primary_yolo, *fast, *fallback]
 
     def refinement_target_numbers(
         self,
@@ -5021,6 +5022,8 @@ class PartsHotspotApp(tk.Tk):
         source = spot.source.lower()
         if "pdf text layer" in source:
             confidence += 0.2
+        elif "hq tiled yolo" in source:
+            confidence += 0.08
         elif "circled number detector" in source:
             confidence += 0.08
         elif "windows ocr" in source:
@@ -5048,6 +5051,8 @@ class PartsHotspotApp(tk.Tk):
         confidence = source_confidence(candidate.source)
         if "pdf text layer" in source:
             return -4.0
+        if "hq tiled yolo" in source:
+            return -3.0 if confidence is not None and confidence >= 0.60 else -1.5
         if "line label ocr" in source:
             return -2.5
         if "dense crop windows ocr" in source:
@@ -5477,10 +5482,10 @@ class PartsHotspotApp(tk.Tk):
             if known_numbers:
                 coverage = len(distinct & known_numbers)
                 unknown = len(distinct - known_numbers)
-                backend_bonus = 0.3 if name.startswith("Windows OCR") else 0.0
+                backend_bonus = 0.6 if name.startswith("HQ tiled YOLO") else 0.0
                 return coverage * 10 - duplicates * 0.4 - unknown * 0.8 + backend_bonus, len(spots)
 
-            backend_bonus = 4.0 if name.startswith("Windows OCR") else 0.0
+            backend_bonus = 4.0 if name.startswith("HQ tiled YOLO") else 0.0
             return len(distinct) * 2 - duplicates * 1.5 + backend_bonus, len(spots)
 
         best_name, best_spots = max(results, key=score)
